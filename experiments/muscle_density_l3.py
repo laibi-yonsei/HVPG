@@ -1,34 +1,55 @@
 """Skeletal muscle / muscle-density analysis for a single abdominal CT volume.
 
-This reproduces the body-composition analysis described in the manuscript
-(Gachon_DeepBody pipeline), applied to ONE CT volume together with its
-segmentation mask.
+Reproduces the radiodensity-based body-composition analysis of:
+    Kim EY, et al. "Prognostic significance of radiodensity-based skeletal
+    muscle quantification using preoperative CT in resected non-small cell lung
+    cancer." J Thorac Dis 2021;13(2):754-761. doi:10.21037/jtd-20-2344
+applied to ONE CT volume together with its segmentation mask.
 
-Mask label convention (as provided by the user):
+How the paper's pipeline works (important for the label convention):
+  * Gachon_DeepBody (U-Net) SEGMENTS tissue types: skeletal muscle,
+    subcutaneous fat, visceral fat. So the segmentation labels are *tissues*.
+  * The radiodensity sub-classes (very-low / low / high attenuation muscle) are
+    NOT separate labels -- they are computed AFTERWARDS by HU thresholding
+    inside the muscle mask (Figure 1).
+
+Therefore the expected mask label convention is tissue-based, e.g.:
 
     0 = background
-    1 = skeletal muscle              (HU  -25 .. 150, the whole muscle)
-    2 = very low attenuation muscle  (VLAM, HU -30 ..   0)
-    3 = low attenuation muscle       (LAM,  HU   0 ..  30)
-    4 = high attenuation muscle      (HAM,  HU  30 .. 150)
+    1 = skeletal muscle
+    2 = subcutaneous fat
+    3 = visceral fat
+    4 = (e.g. intermuscular fat / IMAT, if present)
 
-Because labels 2/3/4 are HU-based sub-classes of label 1, a single integer
-label per voxel cannot represent the overlap cleanly. To stay faithful to the
-paper -- which defines *every* quantity by HU thresholds -- this script:
+Only the muscle label(s) feed the analysis. If your mask uses a different
+mapping, set --muscle-labels accordingly. RUN ONCE and read the per-label
+mean-HU diagnostic: the muscle label should have a mean HU well above 0
+(roughly +20..+50), whereas fat labels sit around -90..-110 HU.
 
-  1. Builds the "skeletal muscle region" from the mask (all muscle labels).
-  2. Re-derives total muscle and the VLAM / LAM / HAM sub-classes directly from
-     the CT Hounsfield-Unit values inside that region.
-  3. Also reports the raw per-label voxel counts and mean HU, so you can verify
-     what each label actually contains.
+To stay faithful to the paper -- which defines every quantity by HU -- this
+script takes the muscle region from the mask and re-derives total muscle and
+the attenuation sub-classes directly from the CT Hounsfield-Unit values.
+
+HU definitions used (paper):
+  * total skeletal muscle : -29 .. 150 HU
+  * low  attenuation msc  : -29 .. <30 HU   (VLAM + LAM combined)
+  * high attenuation msc  :  30 .. 150 HU
+  * muscle density proportion = low-attenuation / total skeletal muscle
+  * healthy muscle  = proportion < 24.5 % (maximal chi-squared cut-off);
+    unhealthy = proportion >= 24.5 %
+Finer sub-classes are also reported: VLAM (-30..0), LAM (0..30), HAM (30..150).
 
 Metrics reported (whole 3D volume, all slices integrated):
   * Total skeletal muscle volume (cm^3) and mean muscle density (SMD, HU)
-  * VLAM / LAM / HAM volumes and their proportions
-  * Low-attenuation muscle proportion = vol(HU < 30) / vol(total muscle)
-    -> the "muscle density proportion" used to define healthy / unhealthy muscle
+  * VLAM / LAM / HAM volumes
+  * Low-attenuation muscle proportion and healthy/unhealthy classification
   * Per-slice cross-sectional muscle area (cm^2), written to CSV
   * Optional single-slice L3 metrics (area, L3MI, sarcopenia) if --l3-slice given
+
+NOTE: the paper computes L3MI and the muscle-density proportion on a SINGLE L3
+cross-section, and the 24.5 % cut-off was derived on that single slice. The
+whole-volume proportion here is a volumetric analogue; pass --l3-slice to also
+get the strict single-slice numbers.
 
 Usage:
     python experiments/muscle_density_l3.py \
@@ -37,7 +58,7 @@ Usage:
         --sex M --height-m 1.70 \
         --out results/case01 \
         [--l3-slice 142] \
-        [--muscle-labels 1 2 3 4]
+        [--muscle-labels 1]
 """
 
 from __future__ import annotations
@@ -64,6 +85,10 @@ LAM_HU_DEFAULT = (0.0, 30.0)
 HAM_HU_DEFAULT = (30.0, 150.0)
 # "Low attenuation muscle" = below this HU (within the total range).
 LOW_ATTEN_CUTOFF_DEFAULT = 30.0
+
+# Healthy-muscle cut-off: low-attenuation proportion below this is "healthy".
+# Paper-derived (maximal chi-squared) optimal cut-off = 24.5 %.
+HEALTHY_CUTOFF_DEFAULT = 0.245
 
 # Sarcopenia L3MI cut-offs (international consensus, cancer cachexia).
 SARCOPENIA_L3MI = {"M": 55.0, "F": 39.0}
@@ -138,6 +163,7 @@ class Results:
     ham_volume_cm3: float = 0.0
     low_atten_volume_cm3: float = 0.0
     low_atten_proportion: float = float("nan")  # vol(<cutoff) / vol(total)
+    healthy_muscle: Optional[bool] = None  # proportion < healthy cutoff
 
     # Optional single-slice L3 metrics.
     l3_slice: Optional[int] = None
@@ -157,6 +183,7 @@ def analyze(
     lam_hu: Tuple[float, float],
     ham_hu: Tuple[float, float],
     low_cutoff: float,
+    healthy_cutoff: float,
     sex: Optional[str],
     height_m: Optional[float],
     l3_slice: Optional[int],
@@ -214,6 +241,11 @@ def analyze(
         if res.total_muscle_volume_cm3 > 0
         else float("nan")
     )
+    res.healthy_muscle = (
+        res.low_atten_proportion < healthy_cutoff
+        if res.total_muscle_volume_cm3 > 0
+        else None
+    )
 
     # --- per-slice cross-sectional area (cm^2) ----------------------------- #
     per_slice = total_mask.reshape(total_mask.shape[0], -1).sum(axis=1)
@@ -265,6 +297,9 @@ def print_report(res: Results) -> None:
     p(f"Low-attenuation muscle volume     : {res.low_atten_volume_cm3:.2f} cm^3")
     p(f"Low-attenuation muscle proportion : {res.low_atten_proportion:.4f} "
       f"({100 * res.low_atten_proportion:.1f} %)")
+    if res.healthy_muscle is not None:
+        label = "HEALTHY" if res.healthy_muscle else "UNHEALTHY"
+        p(f"Muscle classification             : {label}")
     if res.l3_slice is not None:
         p("-" * 64)
         p(f"L3 slice index            : {res.l3_slice}")
@@ -291,6 +326,8 @@ def save_outputs(res: Results, out_dir: str) -> None:
         w.writerow(["ham_volume", f"{res.ham_volume_cm3:.4f}", "cm^3"])
         w.writerow(["low_atten_volume", f"{res.low_atten_volume_cm3:.4f}", "cm^3"])
         w.writerow(["low_atten_proportion", f"{res.low_atten_proportion:.6f}", "ratio"])
+        if res.healthy_muscle is not None:
+            w.writerow(["healthy_muscle", res.healthy_muscle, "bool"])
         if res.l3_slice is not None:
             w.writerow(["l3_slice", res.l3_slice, "index"])
             w.writerow(["l3_muscle_area", f"{res.l3_muscle_area_cm2:.4f}", "cm^2"])
@@ -321,8 +358,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--mask", required=True, help="segmentation mask (.nii.gz)")
     ap.add_argument("--out", default="results/muscle_density",
                     help="output directory for CSVs")
-    ap.add_argument("--muscle-labels", type=int, nargs="+", default=[1, 2, 3, 4],
-                    help="mask labels that constitute skeletal muscle")
+    ap.add_argument("--muscle-labels", type=int, nargs="+", default=[1],
+                    help="mask label(s) that constitute skeletal muscle "
+                         "(default 1; check the per-label mean-HU diagnostic)")
     ap.add_argument("--sex", choices=["M", "F", "m", "f"], default=None)
     ap.add_argument("--height-m", type=float, default=None,
                     help="patient height in meters (for L3MI)")
@@ -334,6 +372,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--lam-hu", type=float, nargs=2, default=list(LAM_HU_DEFAULT))
     ap.add_argument("--ham-hu", type=float, nargs=2, default=list(HAM_HU_DEFAULT))
     ap.add_argument("--low-cutoff", type=float, default=LOW_ATTEN_CUTOFF_DEFAULT)
+    ap.add_argument("--healthy-cutoff", type=float, default=HEALTHY_CUTOFF_DEFAULT,
+                    help="low-attenuation proportion below which muscle is "
+                         "'healthy' (paper cut-off 0.245)")
     return ap.parse_args()
 
 
@@ -351,6 +392,7 @@ def main() -> None:
         lam_hu=tuple(args.lam_hu),
         ham_hu=tuple(args.ham_hu),
         low_cutoff=args.low_cutoff,
+        healthy_cutoff=args.healthy_cutoff,
         sex=args.sex,
         height_m=args.height_m,
         l3_slice=args.l3_slice,
