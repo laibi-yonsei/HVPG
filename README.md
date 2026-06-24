@@ -3,7 +3,7 @@
 ## 📌 Introduction
 This repository contains the official implementation of the paper:  
 
-**"CT-Based Multimodal AI Accurately Predicts Clinically Significant Portal Hypertension in Cirrhosis"** (In preparation for *Hepatology*).
+**"Multimodal CT-based AI for Noninvasive Estimation of Portal Pressure (IMPACT-HVPG Study)"** (In preparation for *Hepatology*).
 
 We propose a multimodal AI model that integrates **Abdominal CT images** (visual features) and **Clinical Laboratory Data** (clinical features) to non-invasively predict CSPH (HVPG $\ge$ 10 mmHg).
 
